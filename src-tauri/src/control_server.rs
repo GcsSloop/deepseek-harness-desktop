@@ -13,6 +13,7 @@
 //! | POST   | `/panel/open`    | `OpenRequest`                                  |
 //! | POST   | `/panel/bounds`  | `BoundsRequest`                                |
 //! | POST   | `/panel/command` | `CommandRequest`                               |
+//! | POST   | `/panel/snapshot`| `{ ok, image }` — base64 PNG of the panel      |
 //! | GET    | `/health`        | `{ ok, product, version }`                     |
 //! | GET    | `/window/state`  | `{ fullscreen, escapesSwallowed }`             |
 //! | POST   | `/window/fullscreen` | `{ value: bool }`                          |
@@ -41,6 +42,15 @@ struct Health<'a> {
 #[derive(serde::Deserialize)]
 struct FullscreenRequest {
     value: bool,
+}
+
+#[derive(Serialize)]
+struct SnapshotAck {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -151,6 +161,17 @@ pub fn start(app: AppHandle) -> Result<u16, String> {
                         .map_err(|error| format!("invalid command request: {error}"))
                         .and_then(|parsed| browser.command(&parsed));
                     json_response(serde_json::to_string(&Ack { ok: result.is_ok(), error: result.err(), state: None }).unwrap_or_default())
+                }
+                "/panel/snapshot" => {
+                    let captured = browser.snapshot();
+                    json_response(
+                        serde_json::to_string(&SnapshotAck {
+                            ok: captured.is_ok(),
+                            image: captured.as_ref().ok().cloned(),
+                            error: captured.err(),
+                        })
+                        .unwrap_or_default(),
+                    )
                 }
                 "/window/state" => {
                     let fullscreen = app

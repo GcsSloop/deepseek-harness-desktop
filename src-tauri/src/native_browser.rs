@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Webview, WebviewBuilder, WebviewUrl};
 
@@ -221,6 +222,52 @@ impl NativeBrowser {
         }
     }
 
+    /**
+     * Capture the panel as a PNG at the panel's own device resolution.
+     *
+     * Unlike an in-page canvas capture this is the compositor's own bitmap, so
+     * it is never tainted by cross-Origin images and needs no page cooperation.
+     */
+    pub fn snapshot(&self) -> Result<String, String> {
+        let guard = self.panel.lock().map_err(|_| "panel lock poisoned")?;
+        let panel = guard.as_ref().ok_or_else(|| "no browser panel is open".to_string())?;
+        let (sender, receiver) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
+        let sender = std::sync::Mutex::new(sender);
+        panel
+            .webview
+            .with_webview(move |platform| {
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    use block2::RcBlock;
+                    use objc2_app_kit::NSImage;
+                    use objc2_foundation::NSError;
+                    use objc2_web_kit::WKWebView;
+
+                    let view: &WKWebView = &*(platform.inner() as *mut WKWebView);
+                    let completion = RcBlock::new(move |image: *mut NSImage, error: *mut NSError| {
+                        let captured = snapshot_png(image, error);
+                        if let Ok(guard) = sender.lock() {
+                            let _ = guard.send(captured);
+                        }
+                    });
+                    view.takeSnapshotWithConfiguration_completionHandler(None, &completion);
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = platform;
+                    if let Ok(guard) = sender.lock() {
+                        let _ = guard.send(Err("panel snapshots need macOS".to_string()));
+                    }
+                }
+            })
+            .map_err(|error| format!("cannot reach the panel: {error}"))?;
+        match receiver.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(Ok(bytes)) => Ok(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            Ok(Err(message)) => Err(message),
+            Err(_) => Err("panel snapshot timed out".to_string()),
+        }
+    }
+
     /// Report what the panel currently shows.
     pub fn state(&self) -> PanelState {
         let Ok(guard) = self.panel.lock() else {
@@ -235,4 +282,33 @@ impl NativeBrowser {
             None => PanelState { open: false, session: None, url: None },
         }
     }
+}
+
+/** Encode one `takeSnapshot` completion as PNG bytes. */
+#[cfg(target_os = "macos")]
+unsafe fn snapshot_png(image: *mut objc2_app_kit::NSImage, error: *mut objc2_foundation::NSError) -> Result<Vec<u8>, String> {
+    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep};
+    use objc2_foundation::NSDictionary;
+    use std::ptr::NonNull;
+
+    if !error.is_null() {
+        let error = &*error;
+        return Err(format!("panel snapshot failed: {}", error.localizedDescription()));
+    }
+    let Some(image) = image.as_ref() else {
+        return Err("panel snapshot returned no image".to_string());
+    };
+    let tiff = image
+        .TIFFRepresentation()
+        .ok_or_else(|| "panel snapshot has no bitmap representation".to_string())?;
+    let rep = NSBitmapImageRep::imageRepWithData(&tiff)
+        .ok_or_else(|| "panel snapshot is not decodable".to_string())?;
+    let png = rep
+        .representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
+        .ok_or_else(|| "panel snapshot could not be encoded as PNG".to_string())?;
+    let length = png.length();
+    let mut buffer = vec![0u8; length];
+    let pointer = NonNull::new(buffer.as_mut_ptr().cast()).ok_or_else(|| "empty snapshot".to_string())?;
+    png.getBytes_length(pointer, length);
+    Ok(buffer)
 }
