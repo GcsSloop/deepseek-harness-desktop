@@ -24,6 +24,8 @@ pub struct NativeBrowser {
 
 struct Panel {
     session: String,
+    /// Relay target this panel's message handler posts to.
+    endpoint: Option<String>,
     /// The injected bootstrap this panel was created with: a caller that wants a
     /// different bootstrap needs a different panel, because init scripts are
     /// registered at creation and run on every navigation.
@@ -44,6 +46,9 @@ pub struct OpenRequest {
     /// Script injected before page scripts on every navigation.
     #[serde(default)]
     pub bootstrap: String,
+    /// Loopback endpoint the panel's page messages are relayed to.
+    #[serde(default)]
+    pub endpoint: Option<String>,
 }
 
 /// `POST /panel/bounds` body.
@@ -87,6 +92,10 @@ pub struct PanelState {
     /// What the shell applied, so a placement mismatch can be measured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bounds: Option<PanelBounds>,
+    /// Whether the page-to-host relay is armed (the panel's only channel on an
+    /// HTTPS page, where WebKit blocks a loopback request).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub relay: bool,
 }
 
 fn panel_label(session: &str) -> String {
@@ -114,6 +123,7 @@ impl NativeBrowser {
     fn close_current(&self) -> Result<(), String> {
         let mut guard = self.panel.lock().map_err(|_| "panel lock poisoned")?;
         if let Some(panel) = guard.take() {
+            crate::panel_bridge::set_endpoint(None);
             let _ = panel.webview.close();
         }
         Ok(())
@@ -136,6 +146,7 @@ impl NativeBrowser {
             let guard = self.panel.lock().map_err(|_| "panel lock poisoned")?;
             if let Some(panel) = guard.as_ref() {
                 if panel.session == request.session && panel.bootstrap == request.bootstrap {
+                    crate::panel_bridge::set_endpoint(request.endpoint.clone());
                     panel
                         .webview
                         .set_position(LogicalPosition::new(request.x, request.y))
@@ -176,9 +187,17 @@ impl NativeBrowser {
                 LogicalSize::new(request.width, request.height),
             )
             .map_err(|error| format!("cannot create the browser panel: {error}"))?;
+        // The relay target and the script message handler are in place before the
+        // page can get far: a secure page cannot POST to our loopback endpoint
+        // itself, so this handler is its only page-to-host channel.
+        crate::panel_bridge::set_endpoint(request.endpoint.clone());
+        if let Err(error) = crate::panel_bridge::attach(&webview) {
+            eprintln!("native browser panel: {error}");
+        }
         let mut guard = self.panel.lock().map_err(|_| "panel lock poisoned")?;
         *guard = Some(Panel {
             session: request.session.clone(),
+            endpoint: request.endpoint.clone(),
             bootstrap: request.bootstrap.clone(),
             webview,
         });
@@ -283,7 +302,7 @@ impl NativeBrowser {
     /// Report what the panel currently shows.
     pub fn state(&self) -> PanelState {
         let Ok(guard) = self.panel.lock() else {
-            return PanelState { open: false, session: None, url: None, bounds: None };
+            return PanelState { open: false, session: None, url: None, bounds: None, relay: false };
         };
         match guard.as_ref() {
             Some(panel) => {
@@ -307,9 +326,10 @@ impl NativeBrowser {
                     session: Some(panel.session.clone()),
                     url: panel.webview.url().ok().map(|url| url.to_string()),
                     bounds,
+                    relay: panel.endpoint.is_some(),
                 }
             }
-            None => PanelState { open: false, session: None, url: None, bounds: None },
+            None => PanelState { open: false, session: None, url: None, bounds: None, relay: false },
         }
     }
 }

@@ -12,6 +12,7 @@ use tauri::Manager;
 
 mod control_server;
 mod native_browser;
+mod panel_bridge;
 mod window_guard;
 
 use native_browser::NativeBrowser;

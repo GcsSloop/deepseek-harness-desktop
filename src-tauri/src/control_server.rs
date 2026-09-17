@@ -15,6 +15,7 @@
 //! | POST   | `/panel/command` | `CommandRequest`                               |
 //! | POST   | `/panel/snapshot`| `{ ok, image }` — base64 PNG of the panel      |
 //! | GET    | `/health`        | `{ ok, product, version }`                     |
+//! | POST   | `/shell/open`    | `{ url }` — hand a link to the system browser   |
 //! | GET    | `/window/state`  | `{ fullscreen, escapesSwallowed }`             |
 //! | POST   | `/window/fullscreen` | `{ value: bool }`                          |
 
@@ -42,6 +43,37 @@ struct Health<'a> {
 #[derive(serde::Deserialize)]
 struct FullscreenRequest {
     value: bool,
+}
+
+/// `POST /shell/open` body: one absolute http(s) link.
+#[derive(serde::Deserialize)]
+struct OpenExternalRequest {
+    url: String,
+}
+
+/// Hand one link to the user's default browser.
+///
+/// The shell's own webview has no browser tab to give a `target=_blank` click to,
+/// and no page may reach outside the app, so a link the user explicitly asks to
+/// open externally lands here.
+fn open_external(url: &str) -> Result<(), String> {
+    let parsed: url::Url = url.parse().map_err(|error| format!("invalid url: {error}"))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err("only http(s) links can be opened externally".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(parsed.as_str())
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("cannot open the default browser: {error}"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = parsed;
+        Err("opening the system browser is only implemented on macOS".into())
+    }
 }
 
 #[derive(Serialize)]
@@ -137,6 +169,13 @@ pub fn start(app: AppHandle) -> Result<u16, String> {
                     })
                     .unwrap_or_else(|_| "{\"ok\":false}".into()),
                 ),
+                "/shell/open" => {
+                    let body = read_body(&mut request);
+                    let result = serde_json::from_str::<OpenExternalRequest>(&body)
+                        .map_err(|error| format!("invalid open request: {error}"))
+                        .and_then(|parsed| open_external(&parsed.url));
+                    json_response(serde_json::to_string(&Ack { ok: result.is_ok(), error: result.err(), state: None }).unwrap_or_default())
+                }
                 "/panel/state" => {
                     let state = browser.state();
                     json_response(serde_json::to_string(&Ack { ok: true, error: None, state: Some(state) }).unwrap_or_default())
