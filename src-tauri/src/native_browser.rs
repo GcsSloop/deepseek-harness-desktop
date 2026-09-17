@@ -24,8 +24,6 @@ pub struct NativeBrowser {
 
 struct Panel {
     session: String,
-    /// Relay target this panel's message handler posts to.
-    endpoint: Option<String>,
     /// The injected bootstrap this panel was created with: a caller that wants a
     /// different bootstrap needs a different panel, because init scripts are
     /// registered at creation and run on every navigation.
@@ -197,7 +195,6 @@ impl NativeBrowser {
         let mut guard = self.panel.lock().map_err(|_| "panel lock poisoned")?;
         *guard = Some(Panel {
             session: request.session.clone(),
-            endpoint: request.endpoint.clone(),
             bootstrap: request.bootstrap.clone(),
             webview,
         });
@@ -326,7 +323,7 @@ impl NativeBrowser {
                     session: Some(panel.session.clone()),
                     url: panel.webview.url().ok().map(|url| url.to_string()),
                     bounds,
-                    relay: panel.endpoint.is_some(),
+                    relay: crate::panel_bridge::armed(),
                 }
             }
             None => PanelState { open: false, session: None, url: None, bounds: None, relay: false },

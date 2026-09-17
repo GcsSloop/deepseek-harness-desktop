@@ -16,6 +16,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -28,12 +29,25 @@ const MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 /// Where the current panel's page messages are relayed.
 static ENDPOINT: Mutex<Option<String>> = Mutex::new(None);
 
+/// Whether the current panel actually carries the script message handler.
+///
+/// A relay target alone proves nothing: the shell must also have installed the
+/// handler the page posts to, or the panel is back to being unreachable from a
+/// secure document.
+static ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the panel can receive page messages (diagnostic for `/panel/state`).
+pub fn armed() -> bool {
+    ARMED.load(Ordering::Relaxed)
+}
+
 /// Point the relay at the loopback endpoint the current panel reports to.
 pub fn set_endpoint(endpoint: Option<String>) {
     match ENDPOINT.lock() {
         Ok(mut guard) => *guard = endpoint,
         Err(_) => {}
     }
+    ARMED.store(false, Ordering::Relaxed);
 }
 
 /// Relay one page payload to the plugin endpoint, off the main thread.
@@ -107,7 +121,9 @@ pub fn attach(webview: &tauri::Webview<tauri::Wry>) -> Result<(), String> {
             // The controller retains its handler; the local handle may drop.
             std::mem::drop(handler);
         })
-        .map_err(|error| format!("cannot reach the panel to install its message handler: {error}"))
+        .map_err(|error| format!("cannot reach the panel to install its message handler: {error}"))?;
+    ARMED.store(true, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Non-macOS shells have no WKWebView to install a handler on.
@@ -169,3 +185,48 @@ mod handler {
 
 #[cfg(target_os = "macos")]
 use handler::ScriptMessageHandler;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// The relay must write one well-formed POST carrying the page payload.
+    #[test]
+    fn posts_the_payload_to_the_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let endpoint = format!("http://127.0.0.1:{port}/native-event?sessionId=abc&channel=def");
+
+        let accepted = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            let mut buffer = [0u8; 1024];
+            let read = socket.read(&mut buffer).expect("read");
+            String::from_utf8_lossy(&buffer[..read]).to_string()
+        });
+
+        post(&endpoint, br#"{"type":"state"}"#).expect("relay");
+        let request = accepted.join().expect("join");
+        assert!(request.starts_with("POST /native-event?sessionId=abc&channel=def HTTP/1.1\r\n"), "{request}");
+        assert!(request.contains("Content-Length: 16\r\n"), "{request}");
+        assert!(request.ends_with(r#"{"type":"state"}"#), "{request}");
+    }
+
+    /// Only a loopback endpoint may be relayed to, and only over http.
+    #[test]
+    fn refuses_a_foreign_endpoint() {
+        assert!(post("http://example.com/native-event", b"{}").is_err());
+        assert!(post("https://127.0.0.1:1/native-event", b"{}").is_err());
+    }
+
+    /// The arming flag follows the endpoint the panel was opened with.
+    #[test]
+    fn arming_tracks_the_panel() {
+        set_endpoint(None);
+        assert!(!armed());
+        set_endpoint(Some("http://127.0.0.1:1/native-event".to_string()));
+        assert!(!armed(), "a target alone is not an installed handler");
+        set_endpoint(None);
+        assert!(!armed());
+    }
+}
