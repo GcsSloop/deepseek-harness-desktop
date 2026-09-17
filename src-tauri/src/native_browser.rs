@@ -69,12 +69,24 @@ pub struct CommandRequest {
     pub script: Option<String>,
 }
 
+/// Where the panel actually sits, in logical window coordinates.
+#[derive(Debug, Serialize)]
+pub struct PanelBounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
 /// `GET /panel/state` response.
 #[derive(Debug, Serialize)]
 pub struct PanelState {
     pub open: bool,
     pub session: Option<String>,
     pub url: Option<String>,
+    /// What the shell applied, so a placement mismatch can be measured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<PanelBounds>,
 }
 
 fn panel_label(session: &str) -> String {
@@ -271,15 +283,33 @@ impl NativeBrowser {
     /// Report what the panel currently shows.
     pub fn state(&self) -> PanelState {
         let Ok(guard) = self.panel.lock() else {
-            return PanelState { open: false, session: None, url: None };
+            return PanelState { open: false, session: None, url: None, bounds: None };
         };
         match guard.as_ref() {
-            Some(panel) => PanelState {
-                open: true,
-                session: Some(panel.session.clone()),
-                url: panel.webview.url().ok().map(|url| url.to_string()),
-            },
-            None => PanelState { open: false, session: None, url: None },
+            Some(panel) => {
+                let scale = panel
+                    .webview
+                    .window()
+                    .scale_factor()
+                    .unwrap_or(1.0);
+                let bounds = panel.webview.bounds().ok().map(|rect| {
+                    let position = rect.position.to_logical::<f64>(scale);
+                    let size = rect.size.to_logical::<f64>(scale);
+                    PanelBounds {
+                        x: position.x,
+                        y: position.y,
+                        width: size.width,
+                        height: size.height,
+                    }
+                });
+                PanelState {
+                    open: true,
+                    session: Some(panel.session.clone()),
+                    url: panel.webview.url().ok().map(|url| url.to_string()),
+                    bounds,
+                }
+            }
+            None => PanelState { open: false, session: None, url: None, bounds: None },
         }
     }
 }
