@@ -1,0 +1,15 @@
+{
+  "name": "deepseek-harness-desktop",
+  "private": true,
+  "version": "0.1.3",
+  "type": "module",
+  "scripts": {
+    "prepare:runtime": "node scripts/prepare-runtime.mjs",
+    "tauri": "tauri",
+    "dev": "npm run prepare:runtime && tauri dev",
+    "build": "npm run prepare:runtime && tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4"
+  }
+}

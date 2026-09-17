@@ -1,0 +1,8 @@
+/node_modules/
+/src-tauri/target/
+/src-tauri/resources/harness/node_modules/
+/src-tauri/resources/node/
+.DS_Store
+*.log
+/src-tauri/gen/schemas/
+

@@ -1,0 +1,238 @@
+//! Native browser panel: a real WKWebView hosted inside the app window.
+//!
+//! This is the shell half of the "native browser" capability. It owns one child
+//! webview positioned over the main view, loads any http(s) URL in it with a
+//! persistent data store (so logins survive), and injects a bootstrap script
+//! before page scripts on every navigation.
+//!
+//! Everything here is driven through the loopback control API in
+//! `control_server.rs`; the shell knows nothing about the web UI that requests
+//! it, and the harness itself is never modified.
+
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Webview, WebviewBuilder, WebviewUrl};
+
+/// Owns the single browser panel this shell can host.
+#[derive(Default)]
+pub struct NativeBrowser {
+    panel: Mutex<Option<Panel>>,
+}
+
+struct Panel {
+    session: String,
+    /// The injected bootstrap this panel was created with: a caller that wants a
+    /// different bootstrap needs a different panel, because init scripts are
+    /// registered at creation and run on every navigation.
+    bootstrap: String,
+    webview: Webview<tauri::Wry>,
+}
+
+/// `POST /panel/open` body.
+#[derive(Debug, Deserialize)]
+pub struct OpenRequest {
+    /// Caller-owned identity: a new session replaces the current panel.
+    pub session: String,
+    pub url: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    /// Script injected before page scripts on every navigation.
+    #[serde(default)]
+    pub bootstrap: String,
+}
+
+/// `POST /panel/bounds` body.
+#[derive(Debug, Deserialize)]
+pub struct BoundsRequest {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    /// Hide the panel without destroying it (for example while its tab is hidden).
+    #[serde(default)]
+    pub visible: Option<bool>,
+}
+
+/// `POST /panel/command` body.
+#[derive(Debug, Deserialize)]
+pub struct CommandRequest {
+    /// One of `navigate`, `reload`, `back`, `forward`, `eval`, `close`.
+    pub kind: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub script: Option<String>,
+}
+
+/// `GET /panel/state` response.
+#[derive(Debug, Serialize)]
+pub struct PanelState {
+    pub open: bool,
+    pub session: Option<String>,
+    pub url: Option<String>,
+}
+
+fn panel_label(session: &str) -> String {
+    let clean: String = session
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .take(48)
+        .collect();
+    format!("web-review-browser-{clean}")
+}
+
+impl NativeBrowser {
+    /// Persistent web data directory: cookies and logins survive restarts.
+    fn data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+        let dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| format!("cannot resolve the app data directory: {error}"))?
+            .join("browser-panel");
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+        Ok(dir)
+    }
+
+    fn close_current(&self) -> Result<(), String> {
+        let mut guard = self.panel.lock().map_err(|_| "panel lock poisoned")?;
+        if let Some(panel) = guard.take() {
+            let _ = panel.webview.close();
+        }
+        Ok(())
+    }
+
+    /// Create or reuse the panel for one request.
+    pub fn open(&self, app: &AppHandle, request: &OpenRequest) -> Result<(), String> {
+        if request.width < 1.0 || request.height < 1.0 {
+            return Err("panel needs a positive size".into());
+        }
+        let url: url::Url = request
+            .url
+            .parse()
+            .map_err(|error| format!("invalid panel url: {error}"))?;
+        if url.scheme() != "http" && url.scheme() != "https" {
+            return Err("panel url must be http(s)".into());
+        }
+
+        {
+            let guard = self.panel.lock().map_err(|_| "panel lock poisoned")?;
+            if let Some(panel) = guard.as_ref() {
+                if panel.session == request.session && panel.bootstrap == request.bootstrap {
+                    panel
+                        .webview
+                        .set_position(LogicalPosition::new(request.x, request.y))
+                        .map_err(|error| error.to_string())?;
+                    panel
+                        .webview
+                        .set_size(LogicalSize::new(request.width, request.height))
+                        .map_err(|error| error.to_string())?;
+                    panel.webview.show().map_err(|error| error.to_string())?;
+                    if panel.webview.url().map(|current| current.as_str() != url.as_str()).unwrap_or(true) {
+                        panel
+                            .webview
+                            .navigate(url)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // A different session replaces the panel outright.
+        self.close_current()?;
+        let window = app
+            .get_window("main")
+            .ok_or_else(|| "the main window is not available".to_string())?;
+        let label = panel_label(&request.session);
+        let data_dir = Self::data_dir(app)?;
+        let mut builder = WebviewBuilder::new(label.clone(), WebviewUrl::External(url))
+            .data_directory(data_dir)
+            .devtools(true);
+        if !request.bootstrap.is_empty() {
+            builder = builder.initialization_script(request.bootstrap.clone());
+        }
+        let webview = window
+            .add_child(
+                builder,
+                LogicalPosition::new(request.x, request.y),
+                LogicalSize::new(request.width, request.height),
+            )
+            .map_err(|error| format!("cannot create the browser panel: {error}"))?;
+        let mut guard = self.panel.lock().map_err(|_| "panel lock poisoned")?;
+        *guard = Some(Panel {
+            session: request.session.clone(),
+            bootstrap: request.bootstrap.clone(),
+            webview,
+        });
+        Ok(())
+    }
+
+    /// Move, resize, or hide the panel.
+    pub fn bounds(&self, request: &BoundsRequest) -> Result<(), String> {
+        let guard = self.panel.lock().map_err(|_| "panel lock poisoned")?;
+        let panel = guard.as_ref().ok_or_else(|| "no browser panel is open".to_string())?;
+        if request.visible == Some(false) {
+            return panel.webview.hide().map_err(|error| error.to_string());
+        }
+        panel
+            .webview
+            .set_position(LogicalPosition::new(request.x, request.y))
+            .map_err(|error| error.to_string())?;
+        panel
+            .webview
+            .set_size(LogicalSize::new(request.width, request.height))
+            .map_err(|error| error.to_string())?;
+        panel.webview.show().map_err(|error| error.to_string())
+    }
+
+    /// Run one navigation or script command against the panel.
+    pub fn command(&self, request: &CommandRequest) -> Result<(), String> {
+        match request.kind.as_str() {
+            "close" => return self.close_current(),
+            _ => {}
+        }
+        let guard = self.panel.lock().map_err(|_| "panel lock poisoned")?;
+        let panel = guard.as_ref().ok_or_else(|| "no browser panel is open".to_string())?;
+        let webview = &panel.webview;
+        match request.kind.as_str() {
+            "reload" => webview.reload().map_err(|error| error.to_string()),
+            "navigate" => {
+                let url: url::Url = request
+                    .url
+                    .as_deref()
+                    .ok_or_else(|| "navigate needs a url".to_string())?
+                    .parse()
+                    .map_err(|error| format!("invalid url: {error}"))?;
+                webview.navigate(url).map_err(|error| error.to_string())
+            }
+            "eval" => {
+                let script = request
+                    .script
+                    .as_deref()
+                    .ok_or_else(|| "eval needs a script".to_string())?;
+                webview.eval(script).map_err(|error| error.to_string())
+            }
+            other => Err(format!("unsupported panel command: {other}")),
+        }
+    }
+
+    /// Report what the panel currently shows.
+    pub fn state(&self) -> PanelState {
+        let Ok(guard) = self.panel.lock() else {
+            return PanelState { open: false, session: None, url: None };
+        };
+        match guard.as_ref() {
+            Some(panel) => PanelState {
+                open: true,
+                session: Some(panel.session.clone()),
+                url: panel.webview.url().ok().map(|url| url.to_string()),
+            },
+            None => PanelState { open: false, session: None, url: None },
+        }
+    }
+}
