@@ -1,6 +1,6 @@
 [package]
 name = "deepseek-harness-desktop"
-version = "0.1.6"
+version = "0.2.0"
 description = "Desktop wrapper for DeepSeek Harness"
 authors = ["DeepSeek Harness Desktop"]
 edition = "2021"
@@ -20,6 +20,9 @@ url = "2.5.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tiny_http = "0.12"
+# Encodes the panel snapshot for the `/panel/snapshot` response on every
+# platform, so it is not a macOS-only dependency.
+base64 = "0.21.7"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.175"
@@ -31,4 +34,14 @@ objc2-app-kit = { version = "0.3.2", features = ["NSEvent", "NSApplication", "NS
 objc2-web-kit = { version = "0.3.2", features = ["WKWebView", "WKScriptMessage", "WKScriptMessageHandler", "WKUserContentController", "block2"] }
 objc2-foundation = { version = "0.3.2", features = ["NSData", "NSDictionary", "NSError", "NSString"] }
 block2 = "0.6.2"
-base64 = "0.21.7"
+
+# WebView2 (Edge Chromium) hosting for the Windows panel: the child webview
+# itself comes from `Window::add_child`, and this crate supplies the COM
+# interfaces used for the page-to-host relay and the panel snapshot.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38.2"
+windows = { version = "0.61.3", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+] }

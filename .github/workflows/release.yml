@@ -1,12 +1,17 @@
 # Build the DeepSeek Harness desktop shell on a `v*` tag and publish the macOS
-# app + dmg as a GitHub release. The build downloads a pinned Node runtime and
-# installs the pinned official `@deepseek-ai/dsh` artifact into the bundle, so
-# the release is self-contained (no Node/Harness required on the target Mac).
+# and Windows installers as one GitHub release.
 #
-# The app is macOS-only by design (the native browser panel uses WKWebView and
-# the fullscreen-ESC guard uses AppKit). It builds on the arm64 runner, matching
-# Apple Silicon; add `x86_64-apple-darwin` to the Rust targets and a second
-# bundle step to ship a universal or Intel binary.
+# Each target builds on its own runner because the browser panel is a native
+# child view, and the two platforms host it differently: macOS uses a WKWebView
+# and relays page messages through a `WKScriptMessageHandler`, while Windows
+# uses a WebView2 (Edge Chromium) controller and relays through
+# `WebMessageReceived`. The build downloads a pinned Node runtime and installs
+# the pinned official `@deepseek-ai/dsh` artifact into the bundle, so a release
+# is self-contained (no Node/Harness install needed on the target machine).
+#
+# Windows installers are unsigned, so SmartScreen warns on first run; macOS
+# bundles are ad-hoc signed, so Gatekeeper does the same. Both need an
+# Apple Developer ID / Windows code-signing certificate to distribute cleanly.
 name: Release
 
 on:
@@ -23,8 +28,20 @@ env:
 
 jobs:
   build:
-    name: Build macOS app (aarch64)
-    runs-on: macos-14
+    name: Build ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+            artifact: dsh-shell-macos-arm64
+          - label: Windows x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: dsh-shell-windows-x64
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -45,7 +62,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: ${{ matrix.target }}
 
       - name: Cache Rust build
         uses: swatinem/rust-cache@v2
@@ -58,7 +75,8 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Package release artifacts
+      - name: Package release artifacts (macOS)
+        if: matrix.os == 'macos-14'
         run: |
           set -euo pipefail
           mkdir -p release
@@ -67,13 +85,43 @@ jobs:
           ditto -c -k --keepParent "$app" "release/$(basename "$app").zip"
           ls -la release
 
+      - name: Package release artifacts (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item src-tauri/target/release/bundle/msi/*.msi release/
+          Copy-Item src-tauri/target/release/bundle/nsis/*-setup.exe release/
+          Get-ChildItem release
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: release/*
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    needs: build
+    # The tag only becomes a user-facing release after every target built.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          ls -la release
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --title "deepseek-harness-desktop $GITHUB_REF_NAME" \
             --generate-notes \
-            release/*.dmg release/*.zip
+            release/*

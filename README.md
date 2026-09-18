@@ -2,6 +2,20 @@
 
 基于 Tauri 2 的 DeepSeek Harness 桌面封装。应用启动时自动启动内置 Harness 服务并在窗口中打开 Web UI；退出应用时终止 Harness 及其子进程。
 
+## 平台支持
+
+| 平台 | 架构 | WebView 宿主 | 安装包 |
+|---|---|---|---|
+| macOS | arm64（Apple Silicon） | WKWebView（系统内置） | `.dmg`（另附 `.app.zip`） |
+| Windows | x64 | **WebView2**（Edge Chromium 内核） | `.msi` 与 `-setup.exe` |
+
+两个平台原生面板的上层控制 API 完全一致，但底层宿主视图不同：
+
+- **macOS**：`WKWebView` 作为窗口的子视图，页面消息经 `WKScriptMessageHandler`（名字固定为 `dshWebReview`）回到壳进程。
+- **Windows**：**WebView2** 的 `CoreWebView2Controller` 作为窗口的子控制器，页面消息经 `window.chrome.webview.postMessage` → `WebMessageReceived` 回到壳进程。Windows 10/11 自 2021 年起已内置 WebView2 运行时，缺失时安装包会引导下载。
+
+两端都刻意不走「页面直连环回 HTTP」：HTTPS 页面在 WebKit 下会被拒绝发起不安全请求，在 Chromium 下也可能被混合内容 / Private Network Access 规则拦住。把消息交给壳进程转发即可绕开浏览器自身的传输限制。
+
 ## 本地构建
 
 需要 Rust、Node.js 和 pnpm。运行：
@@ -13,7 +27,21 @@ npm run build
 
 构建脚本会下载官方 Node.js 运行时，并安装锁定版本的官方 npm 构建产物 `@deepseek-ai/dsh@0.1.5-rc.1`。客户电脑无需另行安装 Node.js 或 Harness。
 
-macOS 安装包位于 `src-tauri/target/release/bundle/dmg/`，应用包位于 `src-tauri/target/release/bundle/macos/`。
+产物位置：
+
+- macOS：安装包在 `src-tauri/target/release/bundle/dmg/`，应用包在 `src-tauri/target/release/bundle/macos/`
+- Windows：`src-tauri/target/release/bundle/msi/` 与 `src-tauri/target/release/bundle/nsis/`
+
+Windows 上构建同样需要 Rust（MSVC toolchain）、Node.js 和 pnpm。安装包未做代码签名，首次运行会有 SmartScreen 提示；macOS 侧为 ad-hoc 签名，首次打开会有 Gatekeeper 提示。
+
+## 发布
+
+推送 `v*` tag 即触发 `.github/workflows/release.yml`：矩阵在 `macos-14`（arm64）与 `windows-latest`（x64）上分别构建，把各平台安装包作为构件上传，最后统一创建 GitHub Release。
+
+```sh
+git tag -a v0.2.0 -m "deepseek-harness-desktop v0.2.0"
+git push origin v0.2.0
+```
 
 ## 壳提供的两项本地能力
 

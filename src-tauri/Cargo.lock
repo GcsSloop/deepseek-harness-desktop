@@ -537,6 +537,8 @@ dependencies = [
  "tauri-build",
  "tiny_http",
  "url",
+ "webview2-com",
+ "windows",
 ]
 
 [[package]]

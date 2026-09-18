@@ -260,7 +260,7 @@ impl NativeBrowser {
         let guard = self.panel.lock().map_err(|_| "panel lock poisoned")?;
         let panel = guard.as_ref().ok_or_else(|| "no browser panel is open".to_string())?;
         let (sender, receiver) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
-        let sender = std::sync::Mutex::new(sender);
+        let sender = std::sync::Arc::new(std::sync::Mutex::new(sender));
         panel
             .webview
             .with_webview(move |platform| {
@@ -272,19 +272,70 @@ impl NativeBrowser {
                     use objc2_web_kit::WKWebView;
 
                     let view: &WKWebView = &*(platform.inner() as *mut WKWebView);
+                    let completion_sender = std::sync::Arc::clone(&sender);
                     let completion = RcBlock::new(move |image: *mut NSImage, error: *mut NSError| {
                         let captured = snapshot_png(image, error);
-                        if let Ok(guard) = sender.lock() {
+                        if let Ok(guard) = completion_sender.lock() {
                             let _ = guard.send(captured);
                         }
                     });
                     view.takeSnapshotWithConfiguration_completionHandler(None, &completion);
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(windows)]
+                {
+                    use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG;
+                    use webview2_com::CapturePreviewCompletedHandler;
+                    use windows::Win32::Foundation::HGLOBAL;
+                    use windows::Win32::System::Com::StructuredStorage::CreateStreamOnHGlobal;
+                    use windows::Win32::System::Com::IStream;
+
+                    // WebView2 asks the caller for the destination stream, so the
+                    // bitmap lands in an in-memory IStream that is read back once
+                    // the asynchronous capture reports completion.
+                    let core = match unsafe { platform.controller().CoreWebView2() } {
+                        Ok(core) => core,
+                        Err(error) => {
+                            if let Ok(guard) = sender.lock() {
+                                let _ = guard.send(Err(format!("cannot reach the WebView2 core: {error}")));
+                            }
+                            return;
+                        }
+                    };
+                    let stream: IStream = match unsafe { CreateStreamOnHGlobal(HGLOBAL::default(), true) } {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            if let Ok(guard) = sender.lock() {
+                                let _ = guard.send(Err(format!("cannot allocate the snapshot stream: {error}")));
+                            }
+                            return;
+                        }
+                    };
+                    let capture_stream = stream.clone();
+                    let capture_sender = std::sync::Arc::clone(&sender);
+                    let handler = CapturePreviewCompletedHandler::create(Box::new(move |_result| {
+                        let captured = read_png(&capture_stream);
+                        if let Ok(guard) = capture_sender.lock() {
+                            let _ = guard.send(captured);
+                        }
+                        Ok(())
+                    }));
+                    if let Err(error) = unsafe {
+                        core.CapturePreview(
+                            COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
+                            &stream,
+                            &handler,
+                        )
+                    } {
+                        if let Ok(guard) = sender.lock() {
+                            let _ = guard.send(Err(format!("panel snapshot failed: {error}")));
+                        }
+                    }
+                }
+                #[cfg(not(any(target_os = "macos", windows)))]
                 {
                     let _ = platform;
                     if let Ok(guard) = sender.lock() {
-                        let _ = guard.send(Err("panel snapshots need macOS".to_string()));
+                        let _ = guard.send(Err("panel snapshots need macOS or Windows".to_string()));
                     }
                 }
             })
@@ -358,4 +409,36 @@ unsafe fn snapshot_png(image: *mut objc2_app_kit::NSImage, error: *mut objc2_fou
     let pointer = NonNull::new(buffer.as_mut_ptr().cast()).ok_or_else(|| "empty snapshot".to_string())?;
     png.getBytes_length(pointer, length);
     Ok(buffer)
+}
+
+/// Read one WebView2 capture stream back into PNG bytes.
+///
+/// `CapturePreview` writes into a stream the caller supplies; its completed
+/// handler runs on the WebView2 UI thread, so the bytes are handed to the
+/// waiting caller over the channel rather than returned directly.
+#[cfg(windows)]
+fn read_png(stream: &windows::Win32::System::Com::IStream) -> Result<Vec<u8>, String> {
+    use windows::Win32::System::Com::{STATFLAG_NONAME, STATSTG, STREAM_SEEK_SET};
+
+    unsafe {
+        let mut stat = STATSTG::default();
+        stream
+            .Stat(&mut stat, STATFLAG_NONAME)
+            .map_err(|error| format!("panel snapshot has no size: {error}"))?;
+        let size = stat.cbSize as usize;
+        if size == 0 {
+            return Err("panel snapshot is empty".to_string());
+        }
+        stream
+            .Seek(0, STREAM_SEEK_SET, None)
+            .map_err(|error| format!("panel snapshot is not seekable: {error}"))?;
+        let mut buffer = vec![0u8; size];
+        let mut read = 0u32;
+        stream
+            .Read(buffer.as_mut_ptr().cast(), size as u32, Some(&mut read))
+            .ok()
+            .map_err(|error| format!("panel snapshot could not be read: {error}"))?;
+        buffer.truncate(read as usize);
+        Ok(buffer)
+    }
 }

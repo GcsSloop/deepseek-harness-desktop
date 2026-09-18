@@ -21,6 +21,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 /// Script message handler name; the bootstrap posts to exactly this handler.
+///
+/// The name is a WebKit concept only: WebView2 has a single, unnamed message
+/// channel per webview, so the Windows side installs it without a name.
+#[cfg(target_os = "macos")]
 pub const HANDLER_NAME: &str = "dshWebReview";
 
 /// Longest single payload the relay forwards.
@@ -126,8 +130,59 @@ pub fn attach(webview: &tauri::Webview<tauri::Wry>) -> Result<(), String> {
     Ok(())
 }
 
-/// Non-macOS shells have no WKWebView to install a handler on.
-#[cfg(not(target_os = "macos"))]
+/// Install the WebView2 message handler on a freshly created panel webview.
+///
+/// Windows has no `WKScriptMessageHandler`; the equivalent is WebView2's own
+/// `WebMessageReceived`, which the page reaches through
+/// `window.chrome.webview.postMessage(...)`. The contract is the same as the
+/// AppKit side: the payload is reposted from this process, where the browser's
+/// transport rules (mixed content, Private Network Access) do not apply.
+#[cfg(windows)]
+pub fn attach(webview: &tauri::Webview<tauri::Wry>) -> Result<(), String> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2, ICoreWebView2WebMessageReceivedEventArgs,
+    };
+    use webview2_com::WebMessageReceivedEventHandler;
+    use windows::core::PWSTR;
+
+    webview
+        .with_webview(|platform| {
+            let core = match unsafe { platform.controller().CoreWebView2() } {
+                Ok(core) => core,
+                Err(error) => {
+                    eprintln!("native browser panel: cannot reach the WebView2 core: {error}");
+                    return;
+                }
+            };
+            let handler = WebMessageReceivedEventHandler::create(Box::new(
+                move |_sender: Option<ICoreWebView2>,
+                      args: Option<ICoreWebView2WebMessageReceivedEventArgs>| {
+                    let Some(args) = args else { return Ok(()) };
+                    let mut message = PWSTR::null();
+                    if unsafe { args.TryGetWebMessageAsString(&mut message) }.is_ok() {
+                        if let Ok(text) = unsafe { message.to_string() } {
+                            relay(text);
+                        }
+                    }
+                    Ok(())
+                },
+            ));
+            // The token is only needed to unregister later; this handler lives
+            // as long as the panel webview does.
+            let mut token = 0i64;
+            match unsafe { core.add_WebMessageReceived(&handler, &mut token) } {
+                Ok(()) => ARMED.store(true, Ordering::Relaxed),
+                Err(error) => {
+                    eprintln!("native browser panel: cannot install the message handler: {error}")
+                }
+            }
+        })
+        .map_err(|error| format!("cannot reach the panel to install its message handler: {error}"))?;
+    Ok(())
+}
+
+/// Other shells have no native message channel to install.
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn attach(_webview: &tauri::Webview<tauri::Wry>) -> Result<(), String> {
     Ok(())
 }
