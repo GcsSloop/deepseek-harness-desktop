@@ -1,0 +1,79 @@
+# Build the DeepSeek Harness desktop shell on a `v*` tag and publish the macOS
+# app + dmg as a GitHub release. The build downloads a pinned Node runtime and
+# installs the pinned official `@deepseek-ai/dsh` artifact into the bundle, so
+# the release is self-contained (no Node/Harness required on the target Mac).
+#
+# The app is macOS-only by design (the native browser panel uses WKWebView and
+# the fullscreen-ESC guard uses AppKit). It builds on the arm64 runner, matching
+# Apple Silicon; add `x86_64-apple-darwin` to the Rust targets and a second
+# bundle step to ship a universal or Intel binary.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  NODE_VERSION: '24'
+  PNPM_VERSION: '9'
+
+jobs:
+  build:
+    name: Build macOS app (aarch64)
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Tauri CLI
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Package release artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp src-tauri/target/release/bundle/dmg/*.dmg release/
+          app="$(ls -d src-tauri/target/release/bundle/macos/*.app)"
+          ditto -c -k --keepParent "$app" "release/$(basename "$app").zip"
+          ls -la release
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "deepseek-harness-desktop $GITHUB_REF_NAME" \
+            --generate-notes \
+            release/*.dmg release/*.zip
