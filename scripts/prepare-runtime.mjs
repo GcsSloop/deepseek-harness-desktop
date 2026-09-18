@@ -15,9 +15,9 @@ const nodeTarget = join(resources, "node");
 const harnessTarget = join(resources, "harness");
 const stamp = join(nodeTarget, ".runtime-version");
 
-function run(command, args, cwd = root) {
+function run(command, args, cwd = root, shell = false) {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(command, args, { cwd, stdio: "inherit" });
+    const child = spawn(command, args, { cwd, stdio: "inherit", shell });
     child.on("error", reject);
     child.on("exit", (code) => code === 0 ? resolvePromise() : reject(new Error(`${command} exited with ${code}`)));
   });
@@ -83,7 +83,14 @@ async function prepareHarness() {
   if (packageJson.dependencies?.["@deepseek-ai/dsh"] !== DSH_VERSION) {
     throw new Error(`Harness package.json must pin @deepseek-ai/dsh ${DSH_VERSION}`);
   }
-  await run("pnpm", ["install", "--prod", "--ignore-scripts", "--frozen-lockfile", "--config.node-linker=hoisted"], harnessTarget);
+  // A Windows package-manager shim is a `.cmd` batch file, which CreateProcess
+  // cannot start directly, so this one call has to go through a shell there.
+  await run(
+    "pnpm",
+    ["install", "--prod", "--ignore-scripts", "--frozen-lockfile", "--config.node-linker=hoisted"],
+    harnessTarget,
+    process.platform === "win32",
+  );
 
   // The desktop WebView enters from tauri://localhost. A Strict cookie is
   // intentionally secure for normal browser handoff, but WebKit omits it on
