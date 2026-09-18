@@ -1,4 +1,4 @@
-import { access, chmod, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { access, chmod, cp, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { spawn } from "node:child_process";
 import { Readable } from "node:stream";
@@ -53,7 +53,16 @@ async function prepareNode() {
   }
 
   await rm(nodeTarget, { recursive: true, force: true });
-  await rename(join(temp, folder), nodeTarget);
+  const extracted = join(temp, folder);
+  try {
+    await rename(extracted, nodeTarget);
+  } catch (error) {
+    // The system temp directory and the checkout can live on different Windows
+    // volumes, where rename cannot cross devices (EXDEV). Copy instead.
+    if (error?.code !== "EXDEV") throw error;
+    await cp(extracted, nodeTarget, { recursive: true });
+    await rm(extracted, { recursive: true, force: true });
+  }
   if (process.platform !== "win32") {
     await chmod(join(nodeTarget, "bin", "node"), 0o755);
     await Promise.all([
