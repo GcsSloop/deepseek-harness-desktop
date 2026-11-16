@@ -3,9 +3,10 @@
 # so this job must run on a Linux runner: the child browser panel is a native
 # view and cannot be cross-built from macOS.
 #
-# The native browser panel is macOS (WKWebView) and Windows (WebView2) only;
-# on Linux the control API stays up but every panel request reports "unsupported"
-# and dsh-web-review falls back to its non-native preview modes.
+# The native browser panel is macOS (WKWebView) and Windows (WebView2) only.
+# On Linux the control API still starts, but the descriptor advertises no
+# `browser-panel` capability, so dsh-web-review falls back to its CDP/proxy
+# preview modes instead of asking for a panel that cannot be served.
 name: Linux x64 build
 
 on:
@@ -23,7 +24,7 @@ env:
 jobs:
   build:
     name: Build Linux x64
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -113,21 +114,25 @@ jobs:
           test -f "$harness_dir/node_modules/@deepseek-ai/dsh/lib/bin.js"
           "$node_bin" --version
           export DSH_HOME="$(mktemp -d)"
+          log="$(mktemp)"
           port=18999
           (cd "$harness_dir" && exec "$node_bin" node_modules/@deepseek-ai/dsh/lib/bin.js \
-            web --no-open --host 127.0.0.1 --port "$port") &
+            web --no-open --host 127.0.0.1 --port "$port") >"$log" 2>&1 &
           pid=$!
-          code=000
+          # The bare root answers 401; the shell navigates to the token URL the
+          # Harness prints, so this smoke test follows that same URL.
+          url=""
           for _ in $(seq 1 45); do
-            code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" || true)"
-            case "$code" in
-              2*|3*) break ;;
-            esac
+            url="$(awk '/dsh web: /{ sub(/^.*dsh web: /, ""); split($0, parts, / /); print parts[1]; exit }' "$log")"
+            [ -n "$url" ] && break
             sleep 2
           done
           kill "$pid" 2>/dev/null || true
           wait "$pid" 2>/dev/null || true
-          echo "harness responded with HTTP $code"
+          cat "$log"
+          test -n "$url"
+          code="$(curl -s -L -c "$root/cookies" -b "$root/cookies" -o /dev/null -w '%{http_code}' "$url")"
+          echo "token url responded with HTTP $code"
           case "$code" in
             2*|3*) exit 0 ;;
             *) exit 1 ;;

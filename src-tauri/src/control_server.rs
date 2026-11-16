@@ -129,13 +129,21 @@ pub fn advertise(port: u16) -> Result<PathBuf, String> {
     let dir = dsh_home().join("web-review");
     std::fs::create_dir_all(&dir).map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
     let path = dir.join(DESCRIPTOR_NAME);
+    // The panel needs a native child view plus a page->host message channel;
+    // only the macOS (WKWebView) and Windows (WebView2) bridges implement both.
+    // A client must not be told the panel exists on hosts that cannot serve it.
+    let capabilities: &[&str] = if cfg!(any(target_os = "macos", windows)) {
+        &["browser-panel"]
+    } else {
+        &[]
+    };
     let payload = serde_json::json!({
         "schema": 1,
         "port": port,
         "pid": std::process::id(),
         "product": "deepseek-harness-desktop",
         "version": env!("CARGO_PKG_VERSION"),
-        "capabilities": ["browser-panel"],
+        "capabilities": capabilities,
     });
     std::fs::write(&path, format!("{payload}\n"))
         .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
