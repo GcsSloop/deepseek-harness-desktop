@@ -1,0 +1,116 @@
+# Build the desktop shell for Linux x64 (AppImage + deb) without touching the
+# macOS/Windows release matrix. Tauri on Linux hosts the window with WebKitGTK,
+# so this job must run on a Linux runner: the child browser panel is a native
+# view and cannot be cross-built from macOS.
+#
+# The native browser panel is macOS (WKWebView) and Windows (WebView2) only;
+# on Linux the control API stays up but every panel request reports "unsupported"
+# and dsh-web-review falls back to its non-native preview modes.
+name: Linux x64 build
+
+on:
+  push:
+    branches: ['linux/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '24'
+  PNPM_VERSION: '11'
+
+jobs:
+  build:
+    name: Build Linux x64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Tauri CLI
+        run: npm ci
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libssl-dev libxdo-dev pkg-config file xvfb
+
+      # `targets: "all"` in tauri.conf.json would also attempt rpm on Linux, so
+      # name the two bundles this build actually verifies.
+      - name: Prepare runtime and build bundles
+        run: |
+          npm run prepare:runtime
+          npx tauri build --bundles deb,appimage
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp src-tauri/target/release/bundle/deb/*.deb release/
+          cp src-tauri/target/release/bundle/appimage/*.AppImage release/
+          ls -la release
+          (cd release && sha256sum ./* > SHA256SUMS.txt)
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-shell-linux-x64
+          path: release/*
+          if-no-files-found: error
+
+      # Prove the packaged runtime boots on Linux by extracting the deb and
+      # starting the bundled Harness server with the bundled Node binary.
+      - name: Smoke test the bundled Harness
+        run: |
+          set -euo pipefail
+          deb="$(ls release/*.deb | head -n1)"
+          root="$(mktemp -d)"
+          dpkg-deb -x "$deb" "$root"
+          node_bin="$(find "$root" -path '*/resources/node/bin/node' | head -n1)"
+          test -x "$node_bin"
+          harness_dir="$(dirname "$(dirname "$node_bin")")/harness"
+          test -f "$harness_dir/node_modules/@deepseek-ai/dsh/lib/bin.js"
+          "$node_bin" --version
+          export DSH_HOME="$(mktemp -d)"
+          port=18999
+          (cd "$harness_dir" && exec "$node_bin" node_modules/@deepseek-ai/dsh/lib/bin.js \
+            web --no-open --host 127.0.0.1 --port "$port") &
+          pid=$!
+          code=000
+          for _ in $(seq 1 45); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" || true)"
+            case "$code" in
+              2*|3*) break ;;
+            esac
+            sleep 2
+          done
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          echo "harness responded with HTTP $code"
+          case "$code" in
+            2*|3*) exit 0 ;;
+            *) exit 1 ;;
+          esac
