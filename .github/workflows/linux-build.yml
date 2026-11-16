@@ -56,7 +56,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev patchelf libssl-dev libxdo-dev pkg-config file xvfb
+            librsvg2-dev patchelf libssl-dev libxdo-dev pkg-config file xvfb \
+            libgdk-pixbuf2.0-bin librsvg2-bin libglib2.0-bin
           sudo apt-get install -y --no-install-recommends libfuse2t64 \
             || sudo apt-get install -y --no-install-recommends libfuse2 || true
 
@@ -99,12 +100,16 @@ jobs:
       - name: Smoke test the bundled Harness
         run: |
           set -euo pipefail
-          deb="$(ls release/*.deb | head -n1)"
+          deb="$(find release -maxdepth 1 -name '*.deb' -print -quit)"
+          echo "deb: $deb"
           root="$(mktemp -d)"
           dpkg-deb -x "$deb" "$root"
-          node_bin="$(find "$root" -path '*/resources/node/bin/node' | head -n1)"
+          # resources/node/bin/node -> resources/
+          node_bin="$(find "$root" -path '*/resources/node/bin/node' -print -quit)"
+          echo "node: $node_bin"
           test -x "$node_bin"
-          harness_dir="$(dirname "$(dirname "$node_bin")")/harness"
+          harness_dir="$(dirname "$(dirname "$(dirname "$node_bin")")")/harness"
+          echo "harness: $harness_dir"
           test -f "$harness_dir/node_modules/@deepseek-ai/dsh/lib/bin.js"
           "$node_bin" --version
           export DSH_HOME="$(mktemp -d)"
