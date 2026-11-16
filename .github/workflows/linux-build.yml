@@ -57,21 +57,34 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev patchelf libssl-dev libxdo-dev pkg-config file xvfb
+          sudo apt-get install -y --no-install-recommends libfuse2t64 \
+            || sudo apt-get install -y --no-install-recommends libfuse2 || true
+
+      - name: Prepare runtime
+        run: npm run prepare:runtime
 
       # `targets: "all"` in tauri.conf.json would also attempt rpm on Linux, so
-      # name the two bundles this build actually verifies.
-      - name: Prepare runtime and build bundles
-        run: |
-          npm run prepare:runtime
-          npx tauri build --bundles deb,appimage
+      # name the two bundles this build actually wants.
+      - name: Build deb
+        run: npx tauri build --bundles deb
+
+      # AppImage bundling shells out to linuxdeploy, which needs FUSE; the
+      # extract-and-run path also works in containers without it. Either way a
+      # failure here must not discard the deb that already built.
+      - name: Build AppImage
+        continue-on-error: true
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: npx tauri build --bundles appimage
 
       - name: Collect artifacts
         run: |
           set -euo pipefail
           mkdir -p release
-          cp src-tauri/target/release/bundle/deb/*.deb release/
-          cp src-tauri/target/release/bundle/appimage/*.AppImage release/
+          cp src-tauri/target/release/bundle/deb/*.deb release/ 2>/dev/null || true
+          cp src-tauri/target/release/bundle/appimage/*.AppImage release/ 2>/dev/null || true
           ls -la release
+          test -n "$(ls -A release)"
           (cd release && sha256sum ./* > SHA256SUMS.txt)
 
       - name: Upload artifacts
